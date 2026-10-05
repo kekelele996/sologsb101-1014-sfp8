@@ -5,7 +5,6 @@
  */
 import { useMemo, useState } from 'react';
 import {
-  Alert,
   App,
   Button,
   Card,
@@ -18,6 +17,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -28,14 +28,18 @@ import {
   PlusOutlined,
   RiseOutlined,
   FallOutlined,
+  ThunderboltOutlined,
   ToolOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
 import EmptyPanel from '../components/common/EmptyPanel';
 import RateTag from '../components/common/RateTag';
 import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
+import { useReplantAlerts, type ReplantAlert } from '../hooks/useReplantAlerts';
 import { usePlotStore } from '../stores/plotStore';
+import { useReplantStore } from '../stores/replantStore';
 import { useSurveyStore } from '../stores/surveyStore';
 import { db } from '../utils/db';
 import { RATE_LEVEL_LABEL, RATE_LEVEL_OPTIONS, type RateLevel, type Survey } from '../types/survey';
@@ -68,12 +72,16 @@ export default function SurveyBoard() {
   const updateSurvey = useSurveyStore((state) => state.updateSurvey);
   const deleteSurvey = useSurveyStore((state) => state.deleteSurvey);
   const surveyRevision = useSurveyStore((state) => state.revision);
+  const generateForPlot = useReplantStore((state) => state.generateForPlot);
+  const generateForPlots = useReplantStore((state) => state.generateForPlots);
 
   const { rows, loading, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
+  const { alerts, loading: alertsLoading } = useReplantAlerts();
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Survey | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [generating, setGenerating] = useState(false);
   const [form] = Form.useForm<SurveyFormValues>();
 
   const filtered = useMemo(() => {
@@ -190,6 +198,92 @@ export default function SurveyBoard() {
     message.success(result);
   };
 
+  const handleGenerateOne = async (alert: ReplantAlert): Promise<void> => {
+    const result = await generateForPlot(alert.plotId);
+    if (result === 'created') {
+      message.success(`已为「${alert.plotName}」生成补植计划：建议补植 ${alert.suggestReplant.toLocaleString('zh-CN')} 株`);
+    } else if (result === 'skipped') {
+      message.info(`「${alert.plotName}」已有未完成的补植计划，已跳过`);
+    } else {
+      message.info(`「${alert.plotName}」当前无缺株，无需生成补植计划`);
+    }
+  };
+
+  const handleGenerateAll = async (): Promise<void> => {
+    setGenerating(true);
+    try {
+      const { created, skipped } = await generateForPlots(alerts.map((item) => item.plotId));
+      message.success(`批量生成完成：新增 ${created} 条，跳过 ${skipped} 条`);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const alertColumns: ColumnsType<ReplantAlert> = [
+    { title: '地块', dataIndex: 'plotName', key: 'plotName', width: 200 },
+    {
+      title: '最新测次',
+      key: 'round',
+      width: 150,
+      render: (_value, record) => (
+        <Space direction="vertical" size={0}>
+          <Tag color="blue">第 {record.round} 次</Tag>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {record.date}
+          </Typography.Text>
+        </Space>
+      ),
+    },
+    {
+      title: '成活率',
+      key: 'rate',
+      width: 160,
+      render: (_value, record) => <RateTag rate={record.rate} level={record.level} />,
+    },
+    {
+      title: '缺株数',
+      dataIndex: 'missingCount',
+      key: 'missingCount',
+      width: 110,
+      align: 'right',
+      render: (value: number) => `${value.toLocaleString('zh-CN')} 株`,
+    },
+    {
+      title: '建议补植',
+      dataIndex: 'suggestReplant',
+      key: 'suggestReplant',
+      width: 110,
+      align: 'right',
+      render: (value: number) => (
+        <Typography.Text strong type="danger">
+          {value.toLocaleString('zh-CN')} 株
+        </Typography.Text>
+      ),
+    },
+    {
+      title: '操作',
+      key: 'action',
+      width: 210,
+      render: (_value, record) => (
+        <Space size={8}>
+          <Tooltip title={record.hasOpenReplant ? '该地块已有待补植 / 已补植的计划，默认跳过' : undefined}>
+            <Button
+              size="small"
+              type="primary"
+              ghost
+              icon={<ToolOutlined />}
+              disabled={record.hasOpenReplant}
+              onClick={() => void handleGenerateOne(record)}
+            >
+              生成补植计划
+            </Button>
+          </Tooltip>
+          {record.hasOpenReplant ? <Tag color="orange">已有未完成计划</Tag> : null}
+        </Space>
+      ),
+    },
+  ];
+
   const columns: ColumnsType<Survey> = [
     {
       title: '地块',
@@ -300,11 +394,6 @@ export default function SurveyBoard() {
     },
   ];
 
-  const warnPlots = plots.filter((plot) => {
-    const stat = statOf(plot.id);
-    return stat.surveyCount > 0 && stat.latestRate < SURVIVAL_WARN_RATE;
-  });
-
   return (
     <div>
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
@@ -327,24 +416,50 @@ export default function SurveyBoard() {
         />
       </div>
 
-      {warnPlots.length > 0 ? (
-        <Alert
-          type="warning"
-          showIcon
-          style={{ marginBottom: 14 }}
-          message={`有 ${warnPlots.length} 个地块的最新成活率低于 ${SURVIVAL_WARN_RATE}%`}
-          description={
-            <Space direction="vertical" size={2}>
-              {warnPlots.map((plot) => (
-                <span key={plot.id}>
-                  {plot.name}：最新成活率 {percentText(statOf(plot.id).latestRate)}，建议补植{' '}
-                  {statOf(plot.id).suggestReplant} 株
-                </span>
-              ))}
-            </Space>
-          }
-        />
-      ) : null}
+      <Card
+        size="small"
+        style={{ marginBottom: 14, borderColor: alerts.length > 0 ? '#ffccc7' : undefined }}
+        title={
+          <Space size={8}>
+            <WarningOutlined style={{ color: alerts.length > 0 ? '#cf1322' : '#8c8c8c' }} />
+            <span>成活率预警（最新测次低于 {SURVIVAL_WARN_RATE}%）</span>
+            {alerts.length > 0 ? <Tag color="red">{alerts.length} 块</Tag> : null}
+          </Space>
+        }
+        extra={
+          <Button
+            type="primary"
+            danger
+            icon={<ThunderboltOutlined />}
+            disabled={alerts.length === 0}
+            loading={generating}
+            onClick={() => void handleGenerateAll()}
+          >
+            一键为全部预警地块生成计划
+          </Button>
+        }
+      >
+        {alerts.length === 0 ? (
+          <EmptyPanel
+            title="暂无预警地块"
+            description={`所有已验收地块的最新成活率均不低于 ${SURVIVAL_WARN_RATE}%，无需生成补植计划。`}
+          />
+        ) : (
+          <>
+            <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 10, fontSize: 12 }}>
+              按成活率从低到高排列；已有未完成补植计划（待补植 / 已补植）的地块生成时默认跳过。
+            </Typography.Text>
+            <Table<ReplantAlert>
+              rowKey="plotId"
+              size="small"
+              loading={alertsLoading}
+              columns={alertColumns}
+              dataSource={alerts}
+              pagination={false}
+            />
+          </>
+        )}
+      </Card>
 
       <Card
         title="成活率与株高验收台"

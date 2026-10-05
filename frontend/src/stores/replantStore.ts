@@ -44,6 +44,10 @@ export interface ReplantStoreState {
   saveDraft: (replantId: string) => Promise<void>;
   createReplant: (draft: ReplantDraft) => Promise<Replant>;
   deleteReplant: (replantId: string) => Promise<void>;
+  /** 为单个预警地块生成补植计划；已有未完成计划或无缺株时跳过 */
+  generateForPlot: (plotId: string) => Promise<'created' | 'skipped' | 'noMissing'>;
+  /** 一键为全部预警地块生成补植计划，返回新增与跳过条数 */
+  generateForPlots: (plotIds: string[]) => Promise<{ created: number; skipped: number }>;
   /** 推进到下一状态；进入「已补植」时回写地块缺株数并重算成活率 */
   advance: (replantId: string) => Promise<ReplantState | null>;
   setState: (replantId: string, state: ReplantState) => Promise<void>;
@@ -128,6 +132,47 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
       selectedIds: get().selectedIds.filter((id) => id !== replantId),
       revision: get().revision + 1,
     });
+  },
+
+  async generateForPlot(plotId) {
+    const plotState = usePlotStore.getState();
+    const plot = plotState.plots.find((row) => row.id === plotId);
+    if (!plot) return 'skipped';
+    // 已有未完成（待补植 / 已补植）计划的地块默认跳过，避免重复派单
+    const existing = await db.replants.where('plotId').equals(plotId).toArray();
+    if (existing.some((row) => row.state !== '已复核')) return 'skipped';
+    const missing = plotState.summaryOf(plotId).suggestReplant;
+    if (missing <= 0) return 'noMissing';
+    const species = plotState.seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
+    const stamp = nowIso();
+    await putReplant({
+      id: uuid('replant'),
+      plotId,
+      missingCount: missing,
+      planDate: new Date(Date.now() + 15 * 24 * 3600 * 1000).toISOString().slice(0, 10),
+      species,
+      state: '待补植',
+      createdAt: stamp,
+      updatedAt: stamp,
+      revision: 2,
+    });
+    set({
+      revision: get().revision + 1,
+      lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株`,
+    });
+    return 'created';
+  },
+
+  async generateForPlots(plotIds) {
+    let created = 0;
+    let skipped = 0;
+    for (const plotId of plotIds) {
+      const result = await get().generateForPlot(plotId);
+      if (result === 'created') created += 1;
+      else skipped += 1;
+    }
+    set({ lastMessage: `批量生成补植计划完成：新增 ${created} 条，跳过 ${skipped} 条` });
+    return { created, skipped };
   },
 
   async advance(replantId) {
