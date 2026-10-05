@@ -5,7 +5,6 @@
  */
 import { useMemo, useState } from 'react';
 import {
-  Alert,
   App,
   Button,
   Card,
@@ -34,7 +33,9 @@ import dayjs, { type Dayjs } from 'dayjs';
 import EmptyPanel from '../components/common/EmptyPanel';
 import RateTag from '../components/common/RateTag';
 import StatBadge from '../components/common/StatBadge';
+import SurvivalWarningCard from '../components/surveys/SurvivalWarningCard';
 import { useIdbTable } from '../hooks/useIdbTable';
+import { useSurvivalWarnings } from '../hooks/useSurvivalWarnings';
 import { usePlotStore } from '../stores/plotStore';
 import { useSurveyStore } from '../stores/surveyStore';
 import { db } from '../utils/db';
@@ -70,6 +71,9 @@ export default function SurveyBoard() {
   const surveyRevision = useSurveyStore((state) => state.revision);
 
   const { rows, loading, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
+
+  // 低成活率预警（派生口径统一在 hook 内），验收 / 补植变化时由 liveQuery 即时刷新
+  const { warnings, loading: warningsLoading } = useSurvivalWarnings();
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Survey | null>(null);
@@ -300,13 +304,10 @@ export default function SurveyBoard() {
     },
   ];
 
-  const warnPlots = plots.filter((plot) => {
-    const stat = statOf(plot.id);
-    return stat.surveyCount > 0 && stat.latestRate < SURVIVAL_WARN_RATE;
-  });
-
   return (
     <div>
+      <SurvivalWarningCard warnings={warnings} loading={warningsLoading} />
+
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="验收记录" value={rows.length} suffix="条" tone="primary" icon={<ExperimentOutlined />} />
         <StatBadge label="已验收地块" value={stats.ratedCount} suffix="块" tone="info" />
@@ -326,25 +327,6 @@ export default function SurveyBoard() {
           hint={`最新成活率低于 ${SURVIVAL_WARN_RATE}% 的地块`}
         />
       </div>
-
-      {warnPlots.length > 0 ? (
-        <Alert
-          type="warning"
-          showIcon
-          style={{ marginBottom: 14 }}
-          message={`有 ${warnPlots.length} 个地块的最新成活率低于 ${SURVIVAL_WARN_RATE}%`}
-          description={
-            <Space direction="vertical" size={2}>
-              {warnPlots.map((plot) => (
-                <span key={plot.id}>
-                  {plot.name}：最新成活率 {percentText(statOf(plot.id).latestRate)}，建议补植{' '}
-                  {statOf(plot.id).suggestReplant} 株
-                </span>
-              ))}
-            </Space>
-          }
-        />
-      ) : null}
 
       <Card
         title="成活率与株高验收台"

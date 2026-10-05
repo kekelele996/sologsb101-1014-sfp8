@@ -5,6 +5,7 @@
  */
 import { create } from 'zustand';
 import type { RateLevel, Survey } from '../types/survey';
+import type { ReplantState } from '../types/replant';
 import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
 import type { SurvivalSummary } from '../hooks/useSurvivalRate';
 import { nowIso, uuid } from '../utils/id';
@@ -42,8 +43,10 @@ interface SurveyStoreState {
   deleteSurvey: (surveyId: string) => Promise<void>;
   /** 批量调整成活率等级（人工复核） */
   bulkApplyGrade: (level: RateLevel) => Promise<number>;
-  /** 按最新测次生成补植计划（回写地块缺株数） */
+  /** 按最新测次生成补植计划（回写地块缺株数）；已有未完成计划或缺株为 0 时跳过 */
   generateReplant: (plotId: string) => Promise<string>;
+  /** 批量为预警地块生成补植计划，默认跳过已有未完成计划的地块 */
+  generateWarningReplants: (plotIds: string[]) => Promise<{ created: number; skipped: number }>;
   summaryOf: (plotId: string | null) => SurvivalSummary;
   rateStats: () => { total: number; warnCount: number; avgRate: number };
 }
@@ -53,6 +56,48 @@ function totalPlantedOf(plotId: string): number {
     .getState()
     .plantings.filter((row) => row.plotId === plotId)
     .reduce((acc, row) => acc + row.count, 0);
+}
+
+/** 未完成补植计划：尚未复核（待补植 / 已补植），存在时不再重复生成 */
+const REPLANT_OPEN_STATES: ReplantState[] = ['待补植', '已补植'];
+
+interface CreateReplantResult {
+  created: boolean;
+  message: string;
+}
+
+/**
+ * 按地块最新测次写一条补植计划（唯一写库收口）：
+ * - 地块不存在 / 当前无缺株 → 不写库，按跳过处理
+ * - 已有未完成（待补植 / 已补植）补植计划 → 不写库，按跳过处理，避免重复派单
+ */
+async function createReplantForPlot(plotId: string): Promise<CreateReplantResult> {
+  const plot = usePlotStore.getState().plots.find((row) => row.id === plotId);
+  if (!plot) return { created: false, message: '地块不存在，无法生成补植计划' };
+
+  const summary = usePlotStore.getState().summaryOf(plotId);
+  const missing = summary.suggestReplant;
+  if (missing <= 0) return { created: false, message: '该地块当前无缺株，无需生成补植计划' };
+
+  const existing = await db.replants.where('plotId').equals(plotId).toArray();
+  if (existing.some((row) => REPLANT_OPEN_STATES.includes(row.state))) {
+    return { created: false, message: `「${plot.name}」已有未完成补植计划，已跳过` };
+  }
+
+  const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
+  const stamp = nowIso();
+  await db.replants.put({
+    id: uuid('replant'),
+    plotId,
+    missingCount: missing,
+    planDate: new Date(Date.now() + 15 * 24 * 3600 * 1000).toISOString().slice(0, 10),
+    species,
+    state: '待补植',
+    createdAt: stamp,
+    updatedAt: stamp,
+    revision: 2,
+  });
+  return { created: true, message: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` };
 }
 
 export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
@@ -138,26 +183,25 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async generateReplant(plotId) {
-    const summary = get().summaryOf(plotId);
-    const plot = usePlotStore.getState().plots.find((row) => row.id === plotId);
-    if (!plot) return '地块不存在，无法生成补植计划';
-    const missing = summary.suggestReplant;
-    if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
-    const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
-    const stamp = nowIso();
-    await db.replants.put({
-      id: uuid('replant'),
-      plotId,
-      missingCount: missing,
-      planDate: new Date(Date.now() + 15 * 24 * 3600 * 1000).toISOString().slice(0, 10),
-      species,
-      state: '待补植',
-      createdAt: stamp,
-      updatedAt: stamp,
-      revision: 2,
+    const result = await createReplantForPlot(plotId);
+    set({ revision: get().revision + 1 });
+    return result.message;
+  },
+
+  async generateWarningReplants(plotIds) {
+    let created = 0;
+    let skipped = 0;
+    for (const plotId of plotIds) {
+      const result = await createReplantForPlot(plotId);
+      if (result.created) created += 1;
+      else skipped += 1;
+    }
+    set({
+      revision: get().revision + 1,
+      lastMessage:
+        created > 0 ? `已为 ${created} 个预警地块生成补植计划，跳过 ${skipped} 个` : `全部 ${skipped} 个地块已有未完成补植计划，均已跳过`,
     });
-    set({ revision: get().revision + 1, lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` });
-    return `已生成补植计划：缺株 ${missing} 株`;
+    return { created, skipped };
   },
 
   summaryOf(plotId) {
